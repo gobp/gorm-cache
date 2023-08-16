@@ -30,7 +30,7 @@ type plugin struct {
 	keyGenerator func(string) string
 }
 
-func New(config ...Config) *plugin {
+func New(config ...Config) gorm.Plugin {
 	// Set default config
 	cfg := configDefault(config...)
 
