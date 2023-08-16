@@ -50,16 +50,25 @@ func (p *plugin) Name() string {
 func (p *plugin) Initialize(tx *gorm.DB) error {
 	// TODO: see all the callbacks that we can modify
 
-	return tx.Callback().Query().Replace("gorm:query", p.Query)
+	if err := tx.Callback().Query().Replace("gorm:query", p.Query); err != nil {
+		return err
+	}
+
+	if err := tx.Callback().Query().Replace("gorm:row", p.RowQuery); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (p *plugin) Query(tx *gorm.DB) {
+func (p *plugin) RowQuery(tx *gorm.DB) {
 	ctx := tx.Statement.Context
 
 	var ttl time.Duration
 	var hasTTL bool
 
 	if ttl, hasTTL = FromExpiration(ctx); !hasTTL {
+		tx.Logger.Info(ctx, "using default TTL")
 		ttl = p.expires
 	}
 
@@ -75,6 +84,49 @@ func (p *plugin) Query(tx *gorm.DB) {
 
 	// Get from cached data
 	if err := p.QueryCache(key, tx.Statement.Dest); err == nil {
+		tx.Logger.Info(ctx, "from cache")
+		return
+	}
+
+	// Get from database
+	p.RowQueryDB(tx)
+	if tx.Error != nil {
+		return
+	}
+	tx.Logger.Info(ctx, "from database")
+
+	// Persist to cache layer
+	if err := p.SaveCache(key, tx.Statement.Dest, ttl); err != nil {
+		tx.Logger.Error(ctx, err.Error())
+		return
+	}
+	tx.Logger.Info(ctx, "cache persisted")
+}
+
+func (p *plugin) Query(tx *gorm.DB) {
+	ctx := tx.Statement.Context
+
+	var ttl time.Duration
+	var hasTTL bool
+
+	if ttl, hasTTL = FromExpiration(ctx); !hasTTL {
+		tx.Logger.Info(ctx, "using default TTL")
+		ttl = p.expires
+	}
+
+	var key string
+	var hasKey bool
+
+	identifier := buildIdentifier(tx)
+
+	// Checks if there's a custom key
+	if key, hasKey = FromKey(ctx); !hasKey {
+		key = p.prefix + p.keyGenerator(identifier)
+	}
+
+	// Get from cached data
+	if err := p.QueryCache(key, tx.Statement.Dest); err == nil {
+		tx.Logger.Info(ctx, "from cache")
 		return
 	}
 
@@ -83,12 +135,14 @@ func (p *plugin) Query(tx *gorm.DB) {
 	if tx.Error != nil {
 		return
 	}
+	tx.Logger.Info(ctx, "from database")
 
 	// Persist to cache layer
 	if err := p.SaveCache(key, tx.Statement.Dest, ttl); err != nil {
 		tx.Logger.Error(ctx, err.Error())
 		return
 	}
+	tx.Logger.Info(ctx, "cache persisted")
 
 }
 
@@ -130,6 +184,28 @@ func (p *plugin) QueryDB(tx *gorm.DB) {
 			}()
 			gorm.Scan(rows, tx, 0)
 		}
+	}
+}
+
+func (p *plugin) RowQueryDB(tx *gorm.DB) {
+	// HACK: Rewrite the RowQueryDB method here because we don't want to execute callbacks.BuildQuerySQL twice
+	// HACK: Copied from https://github.com/go-gorm/gorm/blob/bae684b3639dff3e35d0ed330bc82c12e8282110/callbacks/row.go#L7-L23
+
+	if tx.Error == nil {
+		// callbacks.BuildQuerySQL(tx) // We don't want this line
+
+		if tx.DryRun || tx.Error != nil {
+			return
+		}
+
+		if isRows, ok := tx.Get("rows"); ok && isRows.(bool) {
+			tx.Statement.Settings.Delete("rows")
+			tx.Statement.Dest, tx.Error = tx.Statement.ConnPool.QueryContext(tx.Statement.Context, tx.Statement.SQL.String(), tx.Statement.Vars...)
+		} else {
+			tx.Statement.Dest = tx.Statement.ConnPool.QueryRowContext(tx.Statement.Context, tx.Statement.SQL.String(), tx.Statement.Vars...)
+		}
+
+		tx.RowsAffected = -1
 	}
 }
 
